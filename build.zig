@@ -23,13 +23,13 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("src"));
 
-    // ONNX Runtime - link from Homebrew installation
-    exe.addIncludePath(.{ .cwd_relative = "/usr/local/Cellar/onnxruntime/1.22.2_7/include/onnxruntime" });
-    exe.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-    exe.linkSystemLibrary("onnxruntime");
-
-    // Add rpath for runtime library loading
-    exe.addRPath(.{ .cwd_relative = "/usr/local/lib" });
+    // ONNX Runtime headers (library is loaded dynamically at runtime)
+    // Prefer 1.20.1 headers for CoreML compatibility, then Homebrew as fallback
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const coreml_include = std.fmt.allocPrint(b.allocator, "{s}/.oceanir/include", .{home}) catch unreachable;
+    exe.addIncludePath(.{ .cwd_relative = coreml_include });
+    exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/onnxruntime" });
+    exe.addIncludePath(.{ .cwd_relative = "/usr/local/include/onnxruntime" });
 
     b.installArtifact(exe);
 
@@ -52,9 +52,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.linkLibC();
-    unit_tests.addIncludePath(.{ .cwd_relative = "/usr/local/Cellar/onnxruntime/1.22.2_7/include/onnxruntime" });
-    unit_tests.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-    unit_tests.linkSystemLibrary("onnxruntime");
+    unit_tests.addIncludePath(.{ .cwd_relative = coreml_include });
+    unit_tests.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/onnxruntime" });
+    unit_tests.addIncludePath(.{ .cwd_relative = "/usr/local/include/onnxruntime" });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

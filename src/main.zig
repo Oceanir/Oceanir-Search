@@ -46,6 +46,8 @@ pub fn main() !void {
             return;
         }
         try testImageEmbed(allocator, args[2]);
+    } else if (std.mem.eql(u8, command, "serve") or std.mem.eql(u8, command, "daemon")) {
+        try runServer(allocator);
     } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         print("Oceanir Search v{s}\n", .{VERSION});
         print("Universal semantic search - text, code, images\n", .{});
@@ -76,6 +78,7 @@ fn printUsage() void {
         \\    search, s <query>    Search indexed files
         \\    index, i [path]      Index files in directory
         \\    status               Show index status
+        \\    serve                Start daemon (keeps model loaded)
         \\    embed-image <path>   Test image embedding
         \\
         \\OPTIONS:
@@ -141,6 +144,9 @@ fn runSearch(allocator: std.mem.Allocator, query: []const u8, path: []const u8) 
     print("\n", .{});
 }
 
+const BATCH_SIZE: usize = 64; // Larger batches for throughput
+const NUM_WORKERS: usize = 4; // Parallel embedding workers
+
 fn runIndex(allocator: std.mem.Allocator, path: []const u8) !void {
     const start_time = std.time.nanoTimestamp();
 
@@ -162,61 +168,96 @@ fn runIndex(allocator: std.mem.Allocator, path: []const u8) !void {
     var idx = store.Store.init(allocator);
     defer idx.deinit();
 
-    // Index each file
+    // Collect all chunks first
+    var all_chunks: std.ArrayListUnmanaged(struct {
+        file_path: []const u8,
+        content: []const u8,
+        start_line: usize,
+        end_line: usize,
+    }) = .{};
+    defer all_chunks.deinit(allocator);
+
     var indexed: usize = 0;
-    var total_chunks: usize = 0;
     var image_count: usize = 0;
 
     for (files.items) |file| {
         if (file.file_type == .image) {
-            // Index image with CLIP
             const img_embedding = vision.embedImage(allocator, file.path) catch |err| {
                 std.debug.print("  Skipping image {s}: {}\n", .{ file.path, err });
                 continue;
             };
-
-            // Pad CLIP embedding (512) to match text embedding size (384) - use first 384 dims
-            // Or store separately - for now, skip images in main index
-            // TODO: Implement proper image index
             allocator.free(img_embedding);
             image_count += 1;
             continue;
         }
 
-        // Text file - chunk and embed
         const chunks = try chunkFile(allocator, file);
         defer allocator.free(chunks);
 
         for (chunks) |chunk| {
-            const embedding = try embeddings.embed(allocator, chunk.content);
-
-            try idx.addChunk(.{
-                .id = try generateId(allocator, file.path, chunk.start_line),
-                .file_path = try allocator.dupe(u8, file.path),
-                .content = try allocator.dupe(u8, chunk.content),
+            try all_chunks.append(allocator, .{
+                .file_path = file.path,
+                .content = chunk.content,
                 .start_line = chunk.start_line,
                 .end_line = chunk.end_line,
-                .embedding = embedding,
             });
-            total_chunks += 1;
         }
         indexed += 1;
     }
+
+    const total_chunks = all_chunks.items.len;
+    print("  Embedding {d} chunks (batch: {d}, workers: {d})...\n", .{ total_chunks, BATCH_SIZE, NUM_WORKERS });
+
+    // Process in large batches
+    var processed: usize = 0;
+    while (processed < total_chunks) {
+        const batch_end = @min(processed + BATCH_SIZE, total_chunks);
+        const batch = all_chunks.items[processed..batch_end];
+
+        var texts = try allocator.alloc([]const u8, batch.len);
+        defer allocator.free(texts);
+        for (batch, 0..) |chunk, i| {
+            texts[i] = chunk.content;
+        }
+
+        const batch_embeddings = try embeddings.embedBatch(allocator, texts);
+        defer {
+            for (batch_embeddings) |emb| allocator.free(emb);
+            allocator.free(batch_embeddings);
+        }
+
+        for (batch, 0..) |chunk, i| {
+            const emb_copy = try allocator.alloc(f32, batch_embeddings[i].len);
+            @memcpy(emb_copy, batch_embeddings[i]);
+
+            try idx.addChunk(.{
+                .id = try generateId(allocator, chunk.file_path, chunk.start_line),
+                .file_path = try allocator.dupe(u8, chunk.file_path),
+                .content = try allocator.dupe(u8, chunk.content),
+                .start_line = chunk.start_line,
+                .end_line = chunk.end_line,
+                .embedding = emb_copy,
+            });
+        }
+
+        processed = batch_end;
+        const pct = (processed * 100) / total_chunks;
+        print("  [{d}%] {d}/{d} chunks\r", .{ pct, processed, total_chunks });
+    }
+    print("\n", .{});
 
     if (image_count > 0) {
         print("  Found {d} images (vision indexing coming soon)\n", .{image_count});
     }
 
-    // Update BM25 stats
     idx.updateBm25Stats();
-
-    // Save
     try idx.save();
 
     const end_time = std.time.nanoTimestamp();
     const elapsed_ms = @as(f64, @floatFromInt(end_time - start_time)) / 1_000_000.0;
+    const chunks_per_sec = @as(f64, @floatFromInt(total_chunks)) / (elapsed_ms / 1000.0);
 
-    print("  Indexed {d} files, {d} chunks in {d:.0}ms\n\n", .{ indexed, total_chunks, elapsed_ms });
+    print("  Indexed {d} files, {d} chunks in {d:.0}ms ({d:.1} chunks/sec)\n\n", .{ indexed, total_chunks, elapsed_ms, chunks_per_sec });
 }
 
 fn runStatus(allocator: std.mem.Allocator) !void {
@@ -433,6 +474,140 @@ fn generateId(allocator: std.mem.Allocator, path: []const u8, line: usize) ![]u8
     const hash = hasher.finalResult();
 
     return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(hash[0..8], .lower)});
+}
+
+fn runServer(allocator: std.mem.Allocator) !void {
+    const stdin = std.fs.File.stdin();
+    const stdout = std.fs.File.stdout();
+
+    // Pre-load embedder (this is the slow part we want to do once)
+    print("Oceanir Search daemon starting...\n", .{});
+    print("Loading embedding model...\n", .{});
+
+    const init_start = std.time.nanoTimestamp();
+    const warmup_emb = try embeddings.embed(allocator, "warmup"); // Force model load
+    allocator.free(warmup_emb);
+    const init_time = @as(f64, @floatFromInt(std.time.nanoTimestamp() - init_start)) / 1_000_000.0;
+
+    print("Model loaded in {d:.0}ms\n", .{init_time});
+    print("Ready. Send JSON queries to stdin.\n", .{});
+    print("Format: {{\"query\": \"your search\"}}\n", .{});
+    print("Send 'quit' or Ctrl+D to exit.\n\n", .{});
+
+    // Load store once
+    var idx = store.Store.load(allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            print("{{\"error\": \"No index found. Run: oceanir-search index <path>\"}}\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer idx.deinit();
+
+    // Read loop - manual line buffering
+    var line_buf: [4096]u8 = undefined;
+    var line_len: usize = 0;
+
+    while (true) {
+        // Read one byte at a time until newline
+        var byte_buf: [1]u8 = undefined;
+        const bytes_read = stdin.read(&byte_buf) catch |err| {
+            print("{{\"error\": \"Read error: {}\"}}\n", .{err});
+            break;
+        };
+
+        if (bytes_read == 0) break; // EOF
+
+        if (byte_buf[0] == '\n') {
+            const input = std.mem.trim(u8, line_buf[0..line_len], " \t\r\n");
+            line_len = 0; // Reset for next line
+
+            if (input.len == 0) continue;
+
+            // Check for quit command
+            if (std.mem.eql(u8, input, "quit") or std.mem.eql(u8, input, "exit")) {
+                _ = stdout.write("{\"status\": \"goodbye\"}\n") catch {};
+                break;
+            }
+
+            // Parse JSON query
+            const query = parseQuery(input) orelse {
+                _ = stdout.write("{\"error\": \"Invalid JSON\"}\n") catch {};
+                continue;
+            };
+
+            // Execute search
+            const start_time = std.time.nanoTimestamp();
+
+            const query_embedding = embeddings.embedQuery(allocator, query) catch {
+                _ = stdout.write("{\"error\": \"Embedding failed\"}\n") catch {};
+                continue;
+            };
+            defer allocator.free(query_embedding);
+
+            var results = hybridSearch(allocator, &idx, query, query_embedding, 10) catch {
+                _ = stdout.write("{\"error\": \"Search failed\"}\n") catch {};
+                continue;
+            };
+            defer results.deinit(allocator);
+
+            localRerank(query, &results);
+
+            const elapsed_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1_000_000.0;
+
+            // Output JSON results
+            var json_buf: [8192]u8 = undefined;
+            var json_stream = std.io.fixedBufferStream(&json_buf);
+            const json_writer = json_stream.writer();
+
+            json_writer.print("{{\"query\": \"{s}\", \"time_ms\": {d:.1}, \"results\": [", .{ query, elapsed_ms }) catch continue;
+
+            for (results.items, 0..) |result, i| {
+                if (i > 0) json_writer.writeAll(",") catch continue;
+                const score_pct: u32 = @intFromFloat(result.score * 100);
+                json_writer.print("{{\"file\": \"{s}\", \"lines\": [{d}, {d}], \"score\": {d}}}", .{
+                    result.chunk.file_path,
+                    result.chunk.start_line,
+                    result.chunk.end_line,
+                    score_pct,
+                }) catch continue;
+            }
+
+            json_writer.writeAll("]}}\n") catch continue;
+            _ = stdout.write(json_stream.getWritten()) catch continue;
+        } else {
+            if (line_len < line_buf.len) {
+                line_buf[line_len] = byte_buf[0];
+                line_len += 1;
+            }
+        }
+    }
+}
+
+fn parseQuery(json: []const u8) ?[]const u8 {
+    // Simple JSON parsing for {"query": "..."}
+    const query_key = "\"query\"";
+    const key_pos = std.mem.indexOf(u8, json, query_key) orelse return null;
+    const after_key = json[key_pos + query_key.len ..];
+
+    // Find colon
+    const colon_pos = std.mem.indexOf(u8, after_key, ":") orelse return null;
+    const after_colon = std.mem.trimLeft(u8, after_key[colon_pos + 1 ..], " \t");
+
+    // Find opening quote
+    if (after_colon.len == 0 or after_colon[0] != '"') return null;
+    const value_start = after_colon[1..];
+
+    // Find closing quote (handle escapes simply)
+    var i: usize = 0;
+    while (i < value_start.len) : (i += 1) {
+        if (value_start[i] == '\\' and i + 1 < value_start.len) {
+            i += 1; // Skip escaped char
+        } else if (value_start[i] == '"') {
+            return value_start[0..i];
+        }
+    }
+    return null;
 }
 
 test "basic search" {
